@@ -161,6 +161,7 @@ function normalizeWebhookEvents(body) {
       for (const change of entry.changes) {
         const value = change.value || {};
 
+        // ── 케이스 A: value.messaging[] 배열 형식 ──────────────
         if (Array.isArray(value.messaging)) {
           for (const messagingEvent of value.messaging) {
             const parsed = parseMessagingEvent({
@@ -172,6 +173,27 @@ function normalizeWebhookEvents(body) {
             if (parsed) {
               events.push(parsed);
             }
+          }
+        }
+
+        // ── 케이스 B: change.value 자체가 메시지 이벤트인 형식 ──
+        // Instagram Platform Webhook "messages" field:
+        // entry[].changes[].field === "messages" 이고
+        // change.value.sender / .recipient / .message 가 바로 있는 경우
+        if (
+          change.field === "messages" &&
+          value.sender &&
+          value.recipient &&
+          value.message
+        ) {
+          const parsed = parseMessagingEvent({
+            objectType: body.object,
+            entry,
+            messagingEvent: value,
+          });
+
+          if (parsed) {
+            events.push(parsed);
           }
         }
       }
@@ -249,6 +271,12 @@ function parseMessagingEvent({ objectType, entry, messagingEvent }) {
 }
 
 async function processDmEvent(event, fullPayload) {
+  // Meta 샘플 payload 감지 (가짜 ID) — 실제 발송 없이 로그만 남김
+  if (event.senderId === "12334" && event.recipientId === "23245") {
+    console.log("[DM] Meta sample payload detected. Skip sending reply.");
+    return;
+  }
+
   console.log("[DM] Processing message:", {
     objectType: event.objectType,
     entryId: event.entryId,
