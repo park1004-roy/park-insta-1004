@@ -161,11 +161,17 @@ async function sendInstagramDM(recipientId, text) {
 
 async function processMessage(event) {
   // 텍스트 메시지만 처리, 에코(자기 발송) 제외
-  if (!event.message?.text || event.message.is_echo) return;
+  if (!event?.message?.text || event?.message?.is_echo) return;
 
-  const senderId = event.sender.id;
-  const messageText = event.message.text;
-  const platformMessageId = event.message.mid ?? null;
+  // sender 또는 sender.id 가 없는 테스트/비정형 페이로드 안전 처리
+  const senderId = event?.sender?.id ?? null;
+  if (!senderId) {
+    console.log('[webhook] skipped: sender.id missing', JSON.stringify(event));
+    return;
+  }
+
+  const messageText = event?.message?.text ?? '';
+  const platformMessageId = event?.message?.mid ?? null;
 
   const [settings, rules] = await Promise.all([getSettings(), getActiveRules()]);
 
