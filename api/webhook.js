@@ -1,281 +1,571 @@
-/**
- * api/webhook.js
- *
- * Vercel Serverless Function — Meta / Instagram Webhook Handler
- *
- * 담당 역할:
- *   GET  /api/webhook  : Meta 웹훅 URL 검증 (Webhook Verification)
- *   POST /api/webhook  : Instagram DM 수신 처리 → 규칙 매칭 → 자동 발송 → 로그 기록
- *
- * 필수 환경 변수 (.env.local / Vercel 대시보드):
- *   VERIFY_TOKEN          Meta 앱 설정에 등록한 임의 검증 문자열
- *   META_ACCESS_TOKEN     Instagram 페이지/앱 액세스 토큰
- *   IG_USER_ID            Instagram 비즈니스 계정 IGSID (그래프 API 발송 대상)
- *   SUPABASE_URL          Supabase 프로젝트 URL  (https://<ref>.supabase.co)
- *   SUPABASE_SERVICE_KEY  Supabase service_role 키 (서버 전용, anon 키 사용 금지)
- */
+// api/webhook.js
+// Vercel Serverless Function + Meta Instagram Messaging Webhook + Supabase
+// CommonJS 기준 코드입니다.
 
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
-const META_ACCESS_TOKEN = process.env.META_ACCESS_TOKEN;
+const crypto = require("crypto");
+const { createClient } = require("@supabase/supabase-js");
+
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
-const IG_USER_ID = process.env.IG_USER_ID;
+const META_ACCESS_TOKEN = process.env.META_ACCESS_TOKEN;
+const META_APP_SECRET = process.env.META_APP_SECRET || "";
+const META_GRAPH_VERSION = process.env.META_GRAPH_VERSION || "v25.0";
 
-// ────────────────────────────────────────────────────────────
-// Supabase REST 헬퍼 (의존 패키지 없이 fetch 직접 사용)
-// ────────────────────────────────────────────────────────────
+// page payload일 때는 recipient.id가 보통 PAGE_ID입니다.
+// 그래도 안정성을 위해 환경변수 META_PAGE_ID가 있으면 우선 사용합니다.
+const META_PAGE_ID = process.env.META_PAGE_ID || "";
 
-async function supabaseFetch(path, options = {}) {
-  const url = `${SUPABASE_URL}/rest/v1${path}`;
-  const res = await fetch(url, {
-    ...options,
-    headers: {
-      apikey: SUPABASE_SERVICE_KEY,
-      Authorization: `Bearer ${SUPABASE_SERVICE_KEY}`,
-      'Content-Type': 'application/json',
-      Prefer: 'return=representation',
-      ...options.headers,
-    },
-  });
+// Supabase
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY =
+  process.env.SUPABASE_SERVICE_ROLE_KEY ||
+  process.env.SUPABASE_ANON_KEY ||
+  "";
 
-  const text = await res.text();
-  if (!res.ok) {
-    throw new Error(`Supabase ${res.status} @ ${path}: ${text}`);
+// 자동응답 테이블 기본값
+// 실제 테이블명이 다르면 Vercel 환경변수 SUPABASE_REPLY_TABLE로 바꾸세요.
+const SUPABASE_REPLY_TABLE =
+  process.env.SUPABASE_REPLY_TABLE || "instagram_auto_replies";
+
+const DEFAULT_REPLY =
+  process.env.DEFAULT_REPLY ||
+  "문의 감사합니다. 확인 후 빠르게 답변드리겠습니다.";
+
+const supabase =
+  SUPABASE_URL && SUPABASE_KEY
+    ? createClient(SUPABASE_URL, SUPABASE_KEY)
+    : null;
+
+module.exports = async function handler(req, res) {
+  try {
+    if (req.method === "GET") {
+      return handleVerification(req, res);
+    }
+
+    if (req.method !== "POST") {
+      res.setHeader("Allow", "GET, POST");
+      return res.status(405).send("Method Not Allowed");
+    }
+
+    const { rawBody, body } = await readMetaBody(req);
+
+    // 선택 보안: META_APP_SECRET이 있으면 X-Hub-Signature-256 검증
+    // raw body를 안정적으로 확보하지 못하는 환경에서는 실패할 수 있으므로,
+    // 현재 운영 안정성을 위해 app secret이 있을 때만 수행합니다.
+    if (META_APP_SECRET) {
+      const valid = verifyMetaSignature(req, rawBody, META_APP_SECRET);
+      if (!valid) {
+        console.error("[META_WEBHOOK] Invalid X-Hub-Signature-256");
+        return res.status(403).send("Invalid signature");
+      }
+    }
+
+    console.log(
+      "[META_WEBHOOK] Incoming object:",
+      body && body.object ? body.object : "unknown"
+    );
+
+    const events = normalizeMetaEvents(body);
+
+    if (events.length === 0) {
+      console.log("[META_WEBHOOK] No processable messaging events.");
+      return res.status(200).send("EVENT_RECEIVED");
+    }
+
+    for (const event of events) {
+      await processMessagingEvent(event);
+    }
+
+    return res.status(200).send("EVENT_RECEIVED");
+  } catch (error) {
+    console.error("[META_WEBHOOK] Fatal error:", safeError(error));
+
+    // Meta 웹훅은 5xx가 반복되면 재시도/차단 이슈가 생길 수 있습니다.
+    // 디버깅 중에는 500을 유지하고, 운영 안정화 후에는 200 처리도 검토 가능합니다.
+    return res.status(500).send("Webhook processing failed");
   }
-  return text ? JSON.parse(text) : [];
+};
+
+function handleVerification(req, res) {
+  const mode = req.query["hub.mode"];
+  const token = req.query["hub.verify_token"];
+  const challenge = req.query["hub.challenge"];
+
+  if (mode === "subscribe" && token === VERIFY_TOKEN) {
+    console.log("[META_WEBHOOK] Verification success");
+    return res.status(200).send(challenge);
+  }
+
+  console.error("[META_WEBHOOK] Verification failed");
+  return res.status(403).send("Forbidden");
 }
 
-// ────────────────────────────────────────────────────────────
-// DB 조회 / 기록 함수
-// ────────────────────────────────────────────────────────────
+async function readMetaBody(req) {
+  // Vercel/Node 환경에 따라 req.body가 object, string, Buffer 중 하나일 수 있습니다.
+  if (Buffer.isBuffer(req.body)) {
+    return {
+      rawBody: req.body,
+      body: JSON.parse(req.body.toString("utf8")),
+    };
+  }
 
-async function getSettings() {
-  const rows = await supabaseFetch('/integration_settings?select=*&limit=1');
-  return rows[0] ?? {
-    fallback_reply: null,
-    dedupe_window: 60,
-    test_mode: false,
+  if (typeof req.body === "string") {
+    return {
+      rawBody: Buffer.from(req.body, "utf8"),
+      body: JSON.parse(req.body),
+    };
+  }
+
+  if (req.body && typeof req.body === "object") {
+    const raw = Buffer.from(JSON.stringify(req.body), "utf8");
+    return {
+      rawBody: raw,
+      body: req.body,
+    };
+  }
+
+  const chunks = [];
+
+  for await (const chunk of req) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+
+  const rawBody = Buffer.concat(chunks);
+  const text = rawBody.toString("utf8");
+
+  return {
+    rawBody,
+    body: text ? JSON.parse(text) : {},
   };
 }
 
-async function getActiveRules() {
-  return supabaseFetch('/rules?select=*&is_active=eq.true&order=priority.desc');
-}
+function verifyMetaSignature(req, rawBody, appSecret) {
+  const signature =
+    req.headers["x-hub-signature-256"] ||
+    req.headers["X-Hub-Signature-256"];
 
-async function isDuplicate(platformMessageId) {
-  const rows = await supabaseFetch(
-    `/incoming_messages?platform_message_id=eq.${encodeURIComponent(platformMessageId)}&select=id&limit=1`,
-  );
-  return rows.length > 0;
-}
-
-async function logIncomingMessage({
-  senderId,
-  messageText,
-  platformMessageId,
-  matchedRuleId,
-  matchStatus,
-  rawPayload,
-}) {
-  const rows = await supabaseFetch('/incoming_messages', {
-    method: 'POST',
-    body: JSON.stringify({
-      sender_id: senderId,
-      message_text: messageText,
-      platform_message_id: platformMessageId ?? null,
-      matched_rule_id: matchedRuleId ?? null,
-      match_status: matchStatus,
-      raw_payload: rawPayload ?? null,
-    }),
-  });
-  return rows[0];
-}
-
-async function logOutgoingMessage({
-  incomingLogId,
-  recipientId,
-  matchedRuleId,
-  sentText,
-  sentLink,
-  sendStatus,
-  errorMessage,
-  metaResponsePayload,
-}) {
-  await supabaseFetch('/outgoing_messages', {
-    method: 'POST',
-    body: JSON.stringify({
-      incoming_log_id: incomingLogId ?? null,
-      recipient_id: recipientId,
-      matched_rule_id: matchedRuleId ?? null,
-      sent_text: sentText,
-      sent_link: sentLink ?? null,
-      send_status: sendStatus,
-      error_message: errorMessage ?? null,
-      meta_response_payload: metaResponsePayload ?? null,
-    }),
-  });
-}
-
-// ────────────────────────────────────────────────────────────
-// 규칙 매칭 (우선순위 내림차순 정렬 상태로 전달받음)
-// ────────────────────────────────────────────────────────────
-
-function matchRules(messageText, rules) {
-  const lower = messageText.toLowerCase().trim();
-  for (const rule of rules) {
-    const keywords = Array.isArray(rule.trigger_keywords) ? rule.trigger_keywords : [];
-    const hit = keywords.some((kw) => {
-      const kwLower = kw.toLowerCase().trim();
-      return rule.match_type === 'exact' ? lower === kwLower : lower.includes(kwLower);
-    });
-    if (hit) return rule;
+  if (!signature || !signature.startsWith("sha256=")) {
+    return false;
   }
-  return null;
-}
 
-// ────────────────────────────────────────────────────────────
-// Instagram DM 발송 (Meta Graph API)
-// ────────────────────────────────────────────────────────────
+  const expected =
+    "sha256=" +
+    crypto.createHmac("sha256", appSecret).update(rawBody).digest("hex");
 
-async function sendInstagramDM(recipientId, text) {
-  const url = `https://graph.instagram.com/v21.0/${IG_USER_ID}/messages`;
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      recipient: { id: recipientId },
-      message: { text },
-      access_token: META_ACCESS_TOKEN,
-    }),
-  });
-  const data = await res.json();
-  if (!res.ok) {
-    throw new Error(data?.error?.message ?? `Meta API ${res.status}`);
+  const expectedBuffer = Buffer.from(expected);
+  const signatureBuffer = Buffer.from(signature);
+
+  if (expectedBuffer.length !== signatureBuffer.length) {
+    return false;
   }
-  return data;
+
+  return crypto.timingSafeEqual(expectedBuffer, signatureBuffer);
 }
 
-// ────────────────────────────────────────────────────────────
-// 단일 DM 이벤트 처리
-// ────────────────────────────────────────────────────────────
+function normalizeMetaEvents(body) {
+  const events = [];
 
-async function processMessage(event) {
-  // 텍스트 메시지만 처리, 에코(자기 발송) 제외
-  if (!event?.message?.text || event?.message?.is_echo) return;
+  if (!body || !Array.isArray(body.entry)) {
+    return events;
+  }
 
-  // sender 또는 sender.id 가 없는 테스트/비정형 페이로드 안전 처리
-  const senderId = event?.sender?.id ?? null;
+  // 핵심 수정점:
+  // 기존 instagram만 통과시키던 조건을 page + instagram 모두 허용합니다.
+  const allowedObjects = new Set(["page", "instagram"]);
+
+  if (!allowedObjects.has(body.object)) {
+    console.warn("[META_WEBHOOK] Unsupported object:", body.object);
+    return events;
+  }
+
+  for (const entry of body.entry) {
+    // 가장 일반적인 Instagram Messaging / Messenger-style payload
+    // body.object === "page"인 경우 보통 이 구조로 들어옵니다.
+    if (Array.isArray(entry.messaging)) {
+      for (const rawEvent of entry.messaging) {
+        const parsed = parseMessagingEvent(rawEvent, entry, body.object);
+        if (parsed) events.push(parsed);
+      }
+    }
+
+    // 일부 Instagram Platform 계열 이벤트는 changes 구조로 들어올 수 있어 방어 처리합니다.
+    if (Array.isArray(entry.changes)) {
+      for (const change of entry.changes) {
+        const value = change.value || {};
+
+        if (Array.isArray(value.messaging)) {
+          for (const rawEvent of value.messaging) {
+            const parsed = parseMessagingEvent(rawEvent, entry, body.object);
+            if (parsed) events.push(parsed);
+          }
+        }
+
+        if (Array.isArray(value.messages)) {
+          for (const message of value.messages) {
+            const rawEvent = convertChangeMessageToMessagingEvent(
+              message,
+              value,
+              entry
+            );
+            const parsed = parseMessagingEvent(rawEvent, entry, body.object);
+            if (parsed) events.push(parsed);
+          }
+        }
+
+        if (value.message) {
+          const rawEvent = convertChangeMessageToMessagingEvent(
+            value.message,
+            value,
+            entry
+          );
+          const parsed = parseMessagingEvent(rawEvent, entry, body.object);
+          if (parsed) events.push(parsed);
+        }
+      }
+    }
+  }
+
+  return events;
+}
+
+function parseMessagingEvent(rawEvent, entry, objectType) {
+  if (!rawEvent || typeof rawEvent !== "object") {
+    return null;
+  }
+
+  // delivery/read/typing 등은 자동응답 대상이 아닙니다.
+  if (rawEvent.delivery || rawEvent.read || rawEvent.optin) {
+    return null;
+  }
+
+  const message = rawEvent.message || {};
+  const postback = rawEvent.postback || {};
+
+  // 봇이 보낸 echo 메시지에 다시 답장하면 무한 루프가 생길 수 있습니다.
+  if (message.is_echo) {
+    console.log("[META_WEBHOOK] Skip echo message.");
+    return null;
+  }
+
+  const senderId =
+    rawEvent.sender?.id ||
+    rawEvent.from?.id ||
+    message.from?.id ||
+    null;
+
+  const recipientId =
+    rawEvent.recipient?.id ||
+    rawEvent.to?.id ||
+    message.to?.id ||
+    entry.id ||
+    null;
+
+  const messageText =
+    message.text ||
+    message.quick_reply?.payload ||
+    postback.payload ||
+    postback.title ||
+    rawEvent.text ||
+    "";
+
+  const attachmentCount = Array.isArray(message.attachments)
+    ? message.attachments.length
+    : 0;
+
+  const messageId =
+    message.mid ||
+    message.id ||
+    rawEvent.mid ||
+    rawEvent.id ||
+    `${senderId || "unknown"}:${rawEvent.timestamp || Date.now()}`;
+
   if (!senderId) {
-    console.log('[webhook] skipped: sender.id missing', JSON.stringify(event));
-    return;
+    console.warn("[META_WEBHOOK] Missing sender.id:", safeJson(rawEvent));
+    return null;
   }
 
-  const messageText = event?.message?.text ?? '';
-  const platformMessageId = event?.message?.mid ?? null;
-
-  const [settings, rules] = await Promise.all([getSettings(), getActiveRules()]);
-
-  // 중복 메시지 차단
-  if (platformMessageId && (await isDuplicate(platformMessageId))) {
-    console.log(`[webhook] duplicate skipped: ${platformMessageId}`);
-    return;
+  if (!recipientId) {
+    console.warn("[META_WEBHOOK] Missing recipient.id:", safeJson(rawEvent));
+    return null;
   }
 
-  // 규칙 매칭
-  const matchedRule = matchRules(messageText, rules);
+  if (!messageText && attachmentCount === 0) {
+    console.log("[META_WEBHOOK] No text/attachment to process.");
+    return null;
+  }
 
-  // 수신 로그 기록
-  const incomingLog = await logIncomingMessage({
+  return {
+    objectType,
+    entryId: entry.id || null,
     senderId,
-    messageText,
-    platformMessageId,
-    matchedRuleId: matchedRule?.id ?? null,
-    matchStatus: matchedRule ? 'matched' : 'unmatched',
-    rawPayload: event,
+    recipientId,
+    messageId,
+    text: String(messageText || "").trim(),
+    hasAttachments: attachmentCount > 0,
+    timestamp: rawEvent.timestamp || entry.time || Date.now(),
+    rawEvent,
+  };
+}
+
+function convertChangeMessageToMessagingEvent(message, value, entry) {
+  return {
+    sender: {
+      id:
+        message?.from?.id ||
+        value?.sender?.id ||
+        value?.from?.id ||
+        value?.user?.id,
+    },
+    recipient: {
+      id:
+        value?.recipient?.id ||
+        value?.to?.id ||
+        value?.account_id ||
+        entry?.id,
+    },
+    timestamp: message?.timestamp || value?.time || entry?.time || Date.now(),
+    message: {
+      mid: message?.mid || message?.id,
+      text:
+        message?.text ||
+        message?.message?.text ||
+        value?.text ||
+        value?.message?.text,
+      attachments: message?.attachments || value?.attachments,
+      is_echo: message?.is_echo,
+    },
+  };
+}
+
+async function processMessagingEvent(event) {
+  console.log("[META_WEBHOOK] Process event:", {
+    objectType: event.objectType,
+    senderId: maskId(event.senderId),
+    recipientId: maskId(event.recipientId),
+    messageId: event.messageId,
+    text: event.text,
+    hasAttachments: event.hasAttachments,
   });
 
-  // 발송할 텍스트 결정
-  const replyText = matchedRule?.reply_text ?? settings.fallback_reply ?? null;
-  const replyLink = matchedRule?.reply_link ?? null;
+  const replyText = await getReplyFromSupabase(event);
 
-  if (!replyText) return;
-
-  // 테스트 모드 → 실제 발송 없이 종료
-  if (settings.test_mode) {
-    console.log(`[webhook][TEST MODE] to=${senderId} text=${replyText}`);
+  if (!replyText) {
+    console.log("[META_WEBHOOK] No reply text resolved.");
     return;
   }
 
-  // DM 발송
-  const fullText = replyLink ? `${replyText}\n${replyLink}` : replyText;
-  let sendStatus = 'success';
-  let errorMessage = null;
-  let metaResponse = null;
+  const sendResult = await sendInstagramReply({
+    senderId: event.senderId,
+    recipientId: event.recipientId,
+    entryId: event.entryId,
+    text: replyText,
+  });
+
+  await saveWebhookLog(event, replyText, sendResult);
+
+  console.log("[META_WEBHOOK] Reply sent:", sendResult);
+}
+
+async function getReplyFromSupabase(event) {
+  if (!supabase) {
+    console.warn("[SUPABASE] Missing Supabase env. Use DEFAULT_REPLY.");
+    return event.hasAttachments
+      ? "이미지/파일 메시지를 확인했습니다. 담당자가 확인 후 답변드리겠습니다."
+      : DEFAULT_REPLY;
+  }
+
+  // 첨부 메시지 전용 기본 답장
+  if (!event.text && event.hasAttachments) {
+    return "이미지/파일 메시지를 확인했습니다. 담당자가 확인 후 답변드리겠습니다.";
+  }
+
+  const incomingText = normalizeText(event.text);
 
   try {
-    metaResponse = await sendInstagramDM(senderId, fullText);
-  } catch (err) {
-    sendStatus = 'failed';
-    errorMessage = err.message;
-    console.error(`[webhook] send failed to ${senderId}:`, err.message);
-  }
+    const { data, error } = await supabase
+      .from(SUPABASE_REPLY_TABLE)
+      .select("*");
 
-  // 발송 로그 기록
-  await logOutgoingMessage({
-    incomingLogId: incomingLog?.id ?? null,
-    recipientId: senderId,
-    matchedRuleId: matchedRule?.id ?? null,
-    sentText: replyText,
-    sentLink: replyLink,
-    sendStatus,
-    errorMessage,
-    metaResponsePayload: metaResponse,
-  });
+    if (error) {
+      console.error("[SUPABASE] Reply table query failed:", error.message);
+      return DEFAULT_REPLY;
+    }
+
+    if (!Array.isArray(data) || data.length === 0) {
+      return DEFAULT_REPLY;
+    }
+
+    // 다양한 컬럼명에 대응합니다.
+    // 권장 컬럼:
+    // keyword, reply_text, is_active
+    const activeRows = data.filter((row) => {
+      if (typeof row.is_active === "boolean") return row.is_active;
+      if (typeof row.active === "boolean") return row.active;
+      if (typeof row.enabled === "boolean") return row.enabled;
+      return true;
+    });
+
+    const exactMatch = activeRows.find((row) => {
+      const keyword = extractKeyword(row);
+      return keyword && normalizeText(keyword) === incomingText;
+    });
+
+    if (exactMatch) {
+      return extractReplyText(exactMatch) || DEFAULT_REPLY;
+    }
+
+    const containsMatch = activeRows.find((row) => {
+      const keyword = extractKeyword(row);
+      return keyword && incomingText.includes(normalizeText(keyword));
+    });
+
+    if (containsMatch) {
+      return extractReplyText(containsMatch) || DEFAULT_REPLY;
+    }
+
+    return DEFAULT_REPLY;
+  } catch (error) {
+    console.error("[SUPABASE] Reply lookup exception:", safeError(error));
+    return DEFAULT_REPLY;
+  }
 }
 
-// ────────────────────────────────────────────────────────────
-// Vercel 핸들러 진입점
-// ────────────────────────────────────────────────────────────
+function extractKeyword(row) {
+  return (
+    row.keyword ||
+    row.trigger ||
+    row.trigger_text ||
+    row.question ||
+    row.input ||
+    ""
+  );
+}
 
-export default async function handler(req, res) {
-  // ── GET: Meta 웹훅 URL 검증 ──
-  if (req.method === 'GET') {
-    const mode = req.query['hub.mode'];
-    const token = req.query['hub.verify_token'];
-    const challenge = req.query['hub.challenge'];
+function extractReplyText(row) {
+  return (
+    row.reply_text ||
+    row.reply ||
+    row.response ||
+    row.answer ||
+    row.message ||
+    row.content ||
+    ""
+  );
+}
 
-    if (mode === 'subscribe' && token === VERIFY_TOKEN) {
-      console.log('[webhook] verification success');
-      return res.status(200).send(challenge);
-    }
-    console.warn('[webhook] verification failed');
-    return res.status(403).json({ error: 'Verification failed' });
+async function sendInstagramReply({ senderId, recipientId, entryId, text }) {
+  if (!META_ACCESS_TOKEN) {
+    throw new Error("Missing META_ACCESS_TOKEN");
   }
 
-  // ── POST: DM 이벤트 수신 ──
-  if (req.method === 'POST') {
-    const body = req.body;
+  // 우선순위:
+  // 1. 환경변수 META_PAGE_ID
+  // 2. payload의 recipient.id
+  // 3. entry.id
+  // 4. me
+  const pageOrAccountId = META_PAGE_ID || recipientId || entryId || "me";
 
-    // Instagram 이벤트만 처리
-    if (body?.object !== 'instagram') {
-      return res.status(200).json({ status: 'ignored' });
-    }
+  const url = `https://graph.facebook.com/${META_GRAPH_VERSION}/${pageOrAccountId}/messages?access_token=${encodeURIComponent(
+    META_ACCESS_TOKEN
+  )}`;
 
-    const entries = Array.isArray(body.entry) ? body.entry : [];
+  const payload = {
+    recipient: {
+      id: senderId,
+    },
+    messaging_type: "RESPONSE",
+    message: {
+      text,
+    },
+  };
 
-    // Meta는 200 응답을 빠르게 받아야 하므로 처리 오류가 나도 200 반환
-    await Promise.allSettled(
-      entries.flatMap((entry) =>
-        (entry.messaging ?? []).map((event) =>
-          processMessage(event).catch((err) =>
-            console.error('[webhook] processMessage error:', err),
-          ),
-        ),
-      ),
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const responseText = await response.text();
+  let responseJson = null;
+
+  try {
+    responseJson = responseText ? JSON.parse(responseText) : null;
+  } catch {
+    responseJson = { raw: responseText };
+  }
+
+  if (!response.ok) {
+    console.error("[META_SEND] Failed:", {
+      status: response.status,
+      body: responseJson,
+    });
+
+    throw new Error(
+      `Meta send failed: HTTP ${response.status} ${safeJson(responseJson)}`
     );
-
-    return res.status(200).json({ status: 'ok' });
   }
 
-  return res.status(405).json({ error: 'Method not allowed' });
+  return {
+    status: response.status,
+    body: responseJson,
+  };
+}
+
+async function saveWebhookLog(event, replyText, sendResult) {
+  if (!supabase) return;
+
+  const logTable = process.env.SUPABASE_DM_LOG_TABLE;
+
+  // 로그 테이블을 아직 만들지 않았다면 저장 생략
+  if (!logTable) return;
+
+  try {
+    const { error } = await supabase.from(logTable).insert({
+      object_type: event.objectType,
+      entry_id: event.entryId,
+      sender_id: event.senderId,
+      recipient_id: event.recipientId,
+      message_id: event.messageId,
+      incoming_text: event.text,
+      reply_text: replyText,
+      meta_response: sendResult,
+      created_at: new Date().toISOString(),
+    });
+
+    if (error) {
+      console.warn("[SUPABASE] Log insert failed:", error.message);
+    }
+  } catch (error) {
+    console.warn("[SUPABASE] Log insert exception:", safeError(error));
+  }
+}
+
+function normalizeText(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+}
+
+function maskId(id) {
+  if (!id) return null;
+  const value = String(id);
+  if (value.length <= 6) return "***";
+  return `${value.slice(0, 3)}***${value.slice(-3)}`;
+}
+
+function safeJson(value) {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function safeError(error) {
+  return {
+    message: error?.message || String(error),
+    stack: error?.stack,
+  };
 }
